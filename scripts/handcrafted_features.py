@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import cv2
 import numpy as np
 import pandas as pd
 from PIL import Image
+from scipy.signal import fftconvolve
 from skimage.feature import graycomatrix, graycoprops, hog, local_binary_pattern
-from skimage.filters import gabor, sobel
+from skimage.filters import gabor_kernel, sobel
 from tqdm.auto import tqdm
 
 
@@ -16,20 +18,23 @@ PATCH_GRID = 4
 
 def recompute_handcrafted_features(targets: pd.DataFrame, output_csv: Path) -> np.ndarray:
     rows: list[dict[str, float | int]] = []
-    for record in tqdm(
-        targets.itertuples(index=False),
-        total=len(targets),
-        desc="[handcrafted]",
-        unit="img",
-    ):
-        with Image.open(record.image_path) as image:
-            feats = extract_all_handcrafted(np.asarray(image.convert("RGB")))
-        rows.append({"row_id": int(record.row_id), **feats})
+    with ProcessPoolExecutor(max_workers=8) as executor:
+        features = executor.map(_extract_image_features, targets["image_path"])
+        for row_id, feats in zip(
+            targets["row_id"],
+            tqdm(features, total=len(targets), desc="[handcrafted]", unit="img"),
+        ):
+            rows.append({"row_id": int(row_id), **feats})
 
     table = pd.DataFrame(rows).sort_values("row_id").reset_index(drop=True)
     output_csv.parent.mkdir(parents=True, exist_ok=True)
     table.to_csv(output_csv, index=False)
     return table.drop(columns=["row_id"]).to_numpy(dtype=np.float32)
+
+
+def _extract_image_features(image_path: str) -> dict[str, float]:
+    with Image.open(image_path) as image:
+        return extract_all_handcrafted(np.asarray(image.convert("RGB")))
 
 
 def extract_all_handcrafted(img_rgb: np.ndarray) -> dict[str, float]:
@@ -120,7 +125,11 @@ def extract_gabor_features(gray: np.ndarray) -> dict[str, float]:
     feats = {}
     for freq in (0.1, 0.3):
         for theta in (0.0, np.pi / 4, np.pi / 2, 3 * np.pi / 4):
-            real, _ = gabor(img_f, frequency=freq, theta=theta)
+            kernel = gabor_kernel(freq, theta=theta, dtype=np.complex64).real
+            pad_y, pad_x = np.asarray(kernel.shape) // 2
+            # Symmetric padding matches ndimage's reflect boundary convention.
+            padded = np.pad(img_f, ((pad_y, pad_y), (pad_x, pad_x)), mode="symmetric")
+            real = fftconvolve(padded, kernel, mode="valid")
             key = f"gabor_f{freq:.1f}_t{theta:.2f}"
             feats[f"{key}_mean"] = float(real.mean())
             feats[f"{key}_std"] = float(real.std())

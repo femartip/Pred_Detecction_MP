@@ -1,167 +1,99 @@
-from __future__ import annotations
-
-from dataclasses import dataclass
+"""Recompute frozen DINOv2 ViT-B/14 embeddings for ROI and full-image views."""
 from pathlib import Path
-from typing import Callable, Iterable
 
+import cv2
 import numpy as np
 import pandas as pd
 import timm
 import torch
 from PIL import Image
-from torchvision.transforms import functional as TF
-
-from .pre_detection_features import crop_candidate_roi, image_to_dino_tensor, resize_short_side
-
-
-@dataclass(frozen=True)
-class EmbeddingSpec:
-    csv_name: str
-    dim: int
-    batch_size: int
-    build_model: Callable[[torch.device], tuple[torch.nn.Module, Callable[[Image.Image], torch.Tensor], str]]
-
+from tqdm.auto import tqdm
 
 def recompute_embeddings(
     targets: pd.DataFrame,
     embedding_dir: Path,
-    csv_names: Iterable[str] | None = None,
+    csv_names: tuple[str, ...] = ("dinov2_vitb14_cv2_roi518.csv", "dinov2_vitb14.csv"),
 ) -> dict[str, np.ndarray]:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     embedding_dir.mkdir(parents=True, exist_ok=True)
-    selected = set(csv_names) if csv_names is not None else None
-    result: dict[str, np.ndarray] = {}
-    for spec in embedding_specs(device):
-        if selected is not None and spec.csv_name not in selected:
-            continue
-        table = compute_embedding_table(targets, embedding_dir / spec.csv_name, spec)
-        result[spec.csv_name] = table.drop(columns=["row_id"]).to_numpy(np.float32)
+    print(f"[embeddings] loading DINOv2 ViT-B/14 on {device}", flush=True)
+    model = timm.create_model(
+        "vit_base_patch14_dinov2", pretrained=True, num_classes=0, dynamic_img_size=True,
+    ).to(device).eval()
+    prefixes = {"dinov2_vitb14_cv2_roi518.csv": "cv2_roi", "dinov2_vitb14.csv": "vitb14"}
+    result = {}
+    with torch.inference_mode():
+        for csv_name in csv_names:
+            prefix = prefixes[csv_name]
+            rows = []
+            for start in tqdm(range(0, len(targets), 16), desc=f"[embeddings] {csv_name}"):
+                batch = targets.iloc[start:start + 16]
+                tensors = []
+                for record in batch.itertuples(index=False):
+                    with Image.open(record.image_path) as image:
+                        image = image.convert("RGB")
+                        if prefix == "cv2_roi":
+                            image = crop_candidate_roi(image)
+                        tensors.append(image_to_dino_tensor(image).squeeze(0))
+                features = model.forward_features(torch.stack(tensors).to(device))
+                values = model.forward_head(features, pre_logits=True).cpu().numpy().astype(np.float32)
+                rows.extend([int(row_id), *value.tolist()] for row_id, value in zip(batch["row_id"], values))
+            columns = ["row_id", *[f"{prefix}_{i:04d}" for i in range(768)]]
+            table = pd.DataFrame(rows, columns=columns).sort_values("row_id").reset_index(drop=True)
+            table.to_csv(embedding_dir / csv_name, index=False)
+            result[csv_name] = table.drop(columns="row_id").to_numpy(np.float32)
     return result
 
 
-def embedding_specs(device: torch.device) -> list[EmbeddingSpec]:
-    return [
-        EmbeddingSpec("dinov2_vitb14_cv2_roi518.csv", 768, 16, lambda d=device: build_dino_model("vit_base_patch14_dinov2", d, roi_dino_tensor)),
-        EmbeddingSpec("dinov2_vitb14.csv", 768, 16, lambda d=device: build_dino_model("vit_base_patch14_dinov2", d, full_dino_tensor)),
-        EmbeddingSpec("dinov2_vitl14_crop.csv", 1024, 8, lambda d=device: build_dino_model("vit_large_patch14_dinov2", d, full_dino_tensor)),
-        EmbeddingSpec("dinov2_vitb_warp518.csv", 768, 16, lambda d=device: build_dino_model("vit_base_patch14_dinov2", d, warp_dino_tensor)),
-        EmbeddingSpec("dinov2_vitb_fivecrop518.csv", 3840, 8, lambda d=device: build_dino_model("vit_base_patch14_dinov2", d, fivecrop_dino_tensor)),
-        EmbeddingSpec("convnext_tiny_imagenet.csv", 768, 32, lambda d=device: build_timm_model("convnext_tiny", d)),
-        EmbeddingSpec("efficientnet_v2_s_imagenet.csv", 1280, 32, lambda d=device: build_timm_model("tf_efficientnetv2_s", d)),
-        EmbeddingSpec("swin_t_imagenet.csv", 768, 32, lambda d=device: build_timm_model("swin_tiny_patch4_window7_224", d)),
-    ]
+def crop_candidate_roi(image: Image.Image) -> Image.Image:
+    arr = np.asarray(image)
+    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
+    background = cv2.GaussianBlur(gray, (0, 0), sigmaX=45, sigmaY=45)
+    corrected = gray - background
+    grad_x = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    grad_y = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    response = np.abs(corrected) + 0.25 * np.hypot(grad_x, grad_y)
+    threshold = max(float(np.percentile(response, 98.8)), float(response.mean() + 2.0 * response.std()))
+    mask = (response >= threshold).astype(np.uint8)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    keep = np.zeros_like(mask)
+    for label in range(1, count):
+        if stats[label, cv2.CC_STAT_AREA] >= 20:
+            keep[labels == label] = 1
+    if keep.sum() == 0:
+        return image
+
+    ys, xs = np.where(keep > 0)
+    h, w = keep.shape
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
+    margin_y = max(48, int(0.25 * (y1 - y0)))
+    margin_x = max(48, int(0.25 * (x1 - x0)))
+    y0, y1 = max(0, y0 - margin_y), min(h, y1 + margin_y)
+    x0, x1 = max(0, x0 - margin_x), min(w, x1 + margin_x)
+    return image.crop((x0, y0, x1, y1))
 
 
-def compute_embedding_table(targets: pd.DataFrame, output_csv: Path, spec: EmbeddingSpec) -> pd.DataFrame:
-    print(f"[embeddings] {output_csv.name}: loading model", flush=True)
-    model, image_transform, prefix = spec.build_model()
-    rows: list[list[float]] = []
-    with torch.inference_mode():
-        for start in range(0, len(targets), spec.batch_size):
-            batch = targets.iloc[start : start + spec.batch_size]
-            rows.extend(encode_batch(batch, model, image_transform))
-            if (start // spec.batch_size) % 10 == 0:
-                print(f"[embeddings] {output_csv.name}: {min(len(rows), len(targets))}/{len(targets)}", flush=True)
-    columns = ["row_id", *[f"{prefix}_{idx:04d}" for idx in range(spec.dim)]]
-    table = pd.DataFrame(rows, columns=columns).sort_values("row_id").reset_index(drop=True)
-    table.to_csv(output_csv, index=False)
-    print(f"[embeddings] {output_csv.name}: written", flush=True)
-    return table
+def resize_short_side(image: Image.Image, size: int) -> Image.Image:
+    w, h = image.size
+    if min(w, h) == size:
+        return image
+    scale = size / min(w, h)
+    return image.resize((round(w * scale), round(h * scale)), Image.Resampling.BICUBIC)
 
 
-def encode_batch(
-    batch: pd.DataFrame,
-    model: torch.nn.Module,
-    image_transform: Callable[[Image.Image], torch.Tensor],
-) -> list[list[float]]:
-    rows: list[list[float]] = []
-    tensors: list[torch.Tensor] = []
-    row_ids: list[int] = []
-    for record in batch.itertuples(index=False):
-        with Image.open(record.image_path) as image:
-            tensor = image_transform(image.convert("RGB"))
-        tensors.append(tensor)
-        row_ids.append(int(record.row_id))
-
-    first = tensors[0]
-    device = next(model.parameters()).device
-    if first.ndim == 4:
-        flat = torch.cat(tensors, dim=0).to(device)
-        values = forward_embedding(model, flat).detach().cpu().numpy().astype(np.float32)
-        crops = first.shape[0]
-        values = values.reshape(len(tensors), crops * values.shape[1])
-    else:
-        stacked = torch.stack(tensors, dim=0).to(device)
-        values = forward_embedding(model, stacked).detach().cpu().numpy().astype(np.float32)
-
-    for row_id, value in zip(row_ids, values):
-        rows.append([row_id, *value.reshape(-1).tolist()])
-    return rows
+def center_crop(image: Image.Image, size: int) -> Image.Image:
+    w, h = image.size
+    left = max(0, (w - size) // 2)
+    top = max(0, (h - size) // 2)
+    return image.crop((left, top, left + size, top + size))
 
 
-def build_dino_model(
-    model_name: str,
-    device: torch.device,
-    image_transform: Callable[[Image.Image], torch.Tensor],
-) -> tuple[torch.nn.Module, Callable[[Image.Image], torch.Tensor], str]:
-    model = timm.create_model(model_name, pretrained=True, num_classes=0, dynamic_img_size=True).to(device).eval()
-    return model, image_transform, dino_prefix(model_name, image_transform)
-
-
-def build_timm_model(model_name: str, device: torch.device) -> tuple[torch.nn.Module, Callable[[Image.Image], torch.Tensor], str]:
-    model = timm.create_model(model_name, pretrained=True, num_classes=0).to(device).eval()
-    data_config = timm.data.resolve_model_data_config(model)
-    transform = timm.data.create_transform(**data_config, is_training=False)
-    return model, transform, imagenet_prefix(model_name)
-
-
-def dino_prefix(model_name: str, image_transform: Callable[[Image.Image], torch.Tensor]) -> str:
-    if image_transform is roi_dino_tensor:
-        return "cv2_roi"
-    if image_transform is warp_dino_tensor:
-        return "vitb_warp518"
-    if image_transform is fivecrop_dino_tensor:
-        return "vitb_fivecrop518"
-    if "large" in model_name:
-        return "vitl14_crop"
-    return "vitb14"
-
-
-def imagenet_prefix(model_name: str) -> str:
-    if model_name == "convnext_tiny":
-        return "convnext_tiny"
-    if model_name == "tf_efficientnetv2_s":
-        return "efficientnet_v2_s"
-    return "swin_t"
-
-
-def forward_embedding(model: torch.nn.Module, tensor: torch.Tensor) -> torch.Tensor:
-    features = model.forward_features(tensor)
-    if hasattr(model, "forward_head"):
-        return model.forward_head(features, pre_logits=True)
-    return model(tensor)
-
-
-def full_dino_tensor(image: Image.Image) -> torch.Tensor:
-    return image_to_dino_tensor(image).squeeze(0)
-
-
-def roi_dino_tensor(image: Image.Image) -> torch.Tensor:
-    return image_to_dino_tensor(crop_candidate_roi(image)).squeeze(0)
-
-
-def warp_dino_tensor(image: Image.Image) -> torch.Tensor:
-    warped = image.resize((518, 518), Image.Resampling.BICUBIC)
-    return normalize_rgb_tensor(TF.to_tensor(warped))
-
-
-def fivecrop_dino_tensor(image: Image.Image) -> torch.Tensor:
-    resized = resize_short_side(image, 560)
-    crops = TF.five_crop(resized, 518)
-    return torch.stack([normalize_rgb_tensor(TF.to_tensor(crop)) for crop in crops], dim=0)
-
-
-def normalize_rgb_tensor(tensor: torch.Tensor) -> torch.Tensor:
-    mean = torch.tensor([0.485, 0.456, 0.406], dtype=tensor.dtype).view(3, 1, 1)
-    std = torch.tensor([0.229, 0.224, 0.225], dtype=tensor.dtype).view(3, 1, 1)
-    return (tensor - mean) / std
+def image_to_dino_tensor(image: Image.Image) -> torch.Tensor:
+    image = resize_short_side(image, 560)
+    image = center_crop(image, 518)
+    arr = np.asarray(image).astype(np.float32) / 255.0
+    arr = (arr - np.array([0.485, 0.456, 0.406], dtype=np.float32)) / np.array([0.229, 0.224, 0.225], dtype=np.float32)
+    return torch.from_numpy(arr.transpose(2, 0, 1)).unsqueeze(0)

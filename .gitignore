@@ -10,6 +10,7 @@ Glass_final_model/
 Cesar/
 docs/
 paper/
+*.out
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

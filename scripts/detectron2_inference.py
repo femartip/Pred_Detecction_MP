@@ -1,3 +1,4 @@
+"Calles inference"
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -8,6 +9,8 @@ import cv2
 import numpy as np
 import pandas as pd
 import pycocotools.mask as mask_utils
+import torch
+from tqdm.auto import tqdm
 
 
 @dataclass(frozen=True)
@@ -17,15 +20,15 @@ class DetectorFoldConfig:
     test_coco_path: Path
 
 
-def build_fold_clean_targets(
-    dataset: str,
+def build_iou_targets(
     image_root: Path,
     fold_configs: list[DetectorFoldConfig],
     output_dir: Path,
-    score_thresh: float = 0.3,
+    score_thresh: float = 0.5,
 ) -> pd.DataFrame:
     rows: list[dict[str, float | int | str]] = []
     for fold, fold_config in enumerate(fold_configs):
+        print(f"[detector] fold {fold}: {fold_config.checkpoint_path}", flush=True)
         split_coco = json.loads(fold_config.test_coco_path.read_text())
         predictions = run_fold_inference(image_root, fold_config, output_dir / f"fold{fold}", score_thresh=score_thresh)
 
@@ -46,7 +49,8 @@ def build_fold_clean_targets(
                     "row_id": row_id,
                     "image_path": str(image_root / Path(str(image["file_name"])).name),
                     "fold": fold,
-                    "iou_target": fold_clean_iou(
+                    "detector_seen_during_training": bool(image["detector_seen_during_training"]),
+                    "iou_target": union_mask_iou(
                         gt_by_image.get(row_id, []),
                         pred_by_image.get(row_id, []),
                         height,
@@ -56,7 +60,7 @@ def build_fold_clean_targets(
             )
 
     targets = pd.DataFrame(rows).sort_values("row_id").reset_index(drop=True)
-    targets.to_csv(output_dir / "fold_clean_targets.csv", index=False)
+    targets.to_csv(output_dir / "iou_targets.csv", index=False)
     return targets
 
 
@@ -64,14 +68,14 @@ def run_fold_inference(
     image_root: Path,
     fold_config: DetectorFoldConfig,
     output_dir: Path,
-    score_thresh: float = 0.3,
+    score_thresh: float = 0.5,
 ) -> list[dict[str, object]]:
     output_dir.mkdir(parents=True, exist_ok=True)
     predictor = build_predictor(fold_config, score_thresh=score_thresh)
 
     split_coco = json.loads(fold_config.test_coco_path.read_text())
     predictions: list[dict[str, object]] = []
-    for image in split_coco["images"]:
+    for image in tqdm(split_coco["images"], desc=f"[detector] {output_dir.name}"):
         image_id = int(image["id"])
         image_path = image_root / Path(str(image["file_name"])).name
         bgr = cv2.imread(str(image_path))
@@ -110,7 +114,7 @@ def build_predictor(fold_config: DetectorFoldConfig, score_thresh: float):
     cfg = get_cfg()
     cfg.merge_from_file(str(fold_config.config_path))
     cfg.MODEL.WEIGHTS = str(fold_config.checkpoint_path)
-    cfg.MODEL.DEVICE = "cuda" if _cuda_available() else "cpu"
+    cfg.MODEL.DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
     cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = score_thresh
     cfg.freeze()
     return DefaultPredictor(cfg)
@@ -143,7 +147,7 @@ def run_predictor_instances(bgr: np.ndarray, predictor) -> dict[str, object]:
     }
 
 
-def fold_clean_iou(polygons: list[list[float]], pred_rles: list[dict[str, object]], height: int, width: int) -> float:
+def union_mask_iou(polygons: list[list[float]], pred_rles: list[dict[str, object]], height: int, width: int) -> float:
     gt_mask = polygons_to_mask(polygons, height, width)
     pred_mask = predictions_to_mask(pred_rles, height, width)
     inter = np.logical_and(gt_mask, pred_mask).sum()
@@ -167,11 +171,3 @@ def predictions_to_mask(pred_rles: list[dict[str, object]], height: int, width: 
     if decoded.ndim == 2:
         return decoded.astype(bool)
     return decoded.any(axis=2).astype(bool)
-
-
-def _cuda_available() -> bool:
-    try:
-        import torch
-        return bool(torch.cuda.is_available())
-    except Exception:
-        return False
