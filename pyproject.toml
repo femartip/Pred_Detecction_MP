@@ -1,0 +1,40 @@
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[project]
+name = "microfibre-iou-metalearner"
+version = "0.1.0"
+description = "Final raw-image-only CA microfibre IoU meta-model"
+readme = "README.md"
+requires-python = ">=3.10,<3.14"
+authors = [{ name = "Felix", email = "fmarper@upv.edu.es" }]
+dependencies = [
+  "numpy>=1.24",
+  "opencv-python>=4.10",
+  "pandas>=2.0",
+  "pillow>=10.0",
+  "pycocotools>=2.0.8",
+  "scikit-image>=0.24",
+  "scikit-learn>=1.4",
+  "scipy>=1.11",
+  "timm>=1.0",
+  "torch>=2.3",
+  "torchvision>=0.18",
+  "xgboost>=2.1",
+  "rfdetr[train,loggers] (>=1.7.1,<2.0.0)",
+]
+
+[project.scripts]
+microfibre-iou = "microfibre_iou.cli:main"
+
+[tool.poetry]
+packages = [{ include = "microfibre_iou" }]
+
+[tool.poetry.group.dev.dependencies]
+pytest = ">=8.0"
+jupyter = "^1.1.1"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
