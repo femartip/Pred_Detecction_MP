@@ -16,13 +16,18 @@ def main(argv: list[str] | None = None) -> None:
     commands = parser.add_subparsers(dest="command", required=True)
     prepare = commands.add_parser("prepare", help="Prepare local HF downloads")
     run = commands.add_parser("run", help="Run pre/post-detection experiments")
-    for command in (prepare, run):
+    compare = commands.add_parser("compare", help="Evaluate calibrated confidence, TTA, RCA and dropout-injection baselines")
+    for command in (prepare, run, compare):
         command.add_argument("--dataset", choices=["ca", "glass", "both"], default="both")
     prepare.add_argument("--downloads", type=Path, default=Path("data/downloads"))
     prepare.add_argument("--models", type=Path, default=Path("models"))
     prepare.add_argument("--destination", type=Path, default=Path("data/Dataset"))
     run.add_argument("--stage", choices=["pre", "post", "both"], default="pre")
     run.add_argument("--reuse-existing", action="store_true")
+    compare.add_argument("--workers", type=int, default=8)
+    compare.add_argument("--baselines", nargs="+", choices=["confidence", "tta", "rca", "dropout", "ensemble"],
+                         default=["confidence", "tta", "rca", "dropout"], help="Run only selected baselines; ensemble trains two new detectors per fold alongside the original")
+    compare.add_argument("--reuse-existing", action="store_true", help="Rebuild metrics and cost summaries from saved scores; no inference")
     args = parser.parse_args(argv)
 
     datasets = ["ca", "glass"] if args.dataset == "both" else [args.dataset]
@@ -34,6 +39,16 @@ def main(argv: list[str] | None = None) -> None:
         return
 
     import pandas as pd
+    if args.command == "compare":
+        from scripts.baseline_comparison import run_baseline_comparison
+
+        results = pd.concat([run_baseline_comparison(dataset, workers=args.workers, baselines=args.baselines,
+                            reuse_existing=args.reuse_existing) for dataset in datasets], ignore_index=True)
+        tables = [Path("outputs/comparison") / dataset / "results.csv" for dataset in ("ca", "glass")]
+        pd.concat([pd.read_csv(path) for path in tables if path.exists()], ignore_index=True).to_csv("outputs/comparison/summary.csv", index=False)
+        print(results.to_string(index=False))
+        return
+
     from scripts.pre_detection_pipeline import run_pre_detection_pipeline
     from scripts.post_detection_pipeline import run_post_detection_pipeline
 

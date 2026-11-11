@@ -68,6 +68,18 @@ outputs/post_detection/glass/oof_predictions.csv
 outputs/post_detection/summary.csv
 ```
 
+## Qualitative Examples
+
+Open `notebooks/qualitative_examples.ipynb` to browse 20 candidates per dataset
+and example type in an `ipywidgets` sliding gallery: correctly estimated high/low
+quality, overconfidence and underconfidence. Use dataset/category selectors,
+Previous/Next or the slider, and click **Use for paper** to choose an image.
+Set `CANDIDATES_PER_CATEGORY = 10` for fewer candidates. Review `SELECTED_IDS`,
+preview the final panels, then set
+`EXPORT = True` to write the two paper figures and selection CSVs under
+`paper/plots/`. The notebook uses saved masks and OOF predictions only and
+defaults to detector-unseen images.
+
 ## Install Dependencies
 
 ```bash
@@ -130,3 +142,54 @@ poetry run python scripts/cli.py run --stage both --dataset both
 Use `--dataset ca` or `--dataset glass` for one dataset. Add `--reuse-existing`
 to refit regressors from existing targets/features; omit it for a fresh run.
 Archived subset results cannot be reused with the full-population splits.
+
+## Baseline Comparison
+
+After post-detection has completed:
+
+```bash
+poetry run python scripts/cli.py compare --dataset both
+```
+
+Choose a subset with `--baselines` (space-separated):
+
+```bash
+poetry run python scripts/cli.py compare --dataset both --baselines ensemble
+poetry run python scripts/cli.py compare --dataset both --baselines confidence tta rca
+poetry run python scripts/cli.py compare --dataset both --baselines dropout
+```
+
+Choices are `confidence`, `tta`, `rca`, `dropout`, and `ensemble`. Without this
+argument, confidence, TTA, RCA and dropout run. Only selected baselines are
+recomputed; saved results, score columns and protocol files for unselected
+baselines are preserved. Existing scores must match the current image IDs, folds
+and targets. The combined summary includes all saved results for both datasets.
+
+
+### Coverage And Computational Cost
+
+`results.csv` and `summary.csv` report accepted-set mean IoU and absolute gain
+over accepting all images at 20% and 40% coverage, plus the accepted image count
+and actual coverage after rounding up. Selection uses calibrated OOF predictions.
+
+Scoring cost is recorded per image for all required passes together, including
+mask aggregation and comparison. `scoring_seconds_mean`, `_median`, `_std` and
+`_sum` summarize these totals across images. 
+
+Rebuild coverage and cost summaries from saved scores without inference:
+
+```bash
+poetry run python scripts/cli.py compare --dataset both --reuse-existing
+```
+
+Older saved confidence/TTA scores have no extraction timings; with
+`--reuse-existing`, these remain missing, not zero. To measure their costs, run
+those baselines normally:
+
+```bash
+poetry run python scripts/cli.py compare --dataset both --baselines confidence tta
+```
+
+By default, every selected baseline recomputes its scores and records scoring
+time. Only `--reuse-existing` skips extraction/inference and rebuilds the metrics
+and timing summaries from saved data.
