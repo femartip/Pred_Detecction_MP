@@ -247,6 +247,10 @@ def run_baseline_comparison(dataset, workers=WORKERS, baselines=None, reuse_exis
     fold_configs = fold_detector_configs(config)
     needs_detector = set(selected).intersection(("confidence", "tta", "dropout", "ensemble"))
     if not reuse_existing and needs_detector:
+        import torch
+
+        if not torch.cuda.is_available():
+            raise RuntimeError("Detector-based baselines require working CUDA; CPU fallback is disabled.")
         for fold in fold_configs:
             for path in (fold.config_path, fold.checkpoint_path):
                 if not path.is_file():

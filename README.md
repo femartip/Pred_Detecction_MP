@@ -22,8 +22,8 @@ For each dataset:
 
 
 For `pre-detection`, detector outputs are used only to define the target.
-Predictors use only raw-image features: hand-crafted descriptors and frozen
-DINOv2 embeddings.
+Predictors use only raw-image information: hand-crafted descriptors, frozen
+DINOv2/ResNet embeddings, or the optional fine-tuned image networks.
 
 For `post-detection`, the same assigned detector is also used to extract:
 
@@ -68,17 +68,35 @@ outputs/post_detection/glass/oof_predictions.csv
 outputs/post_detection/summary.csv
 ```
 
-## Qualitative Examples
+## Trainable Image Baselines
 
-Open `notebooks/qualitative_examples.ipynb` to browse 20 candidates per dataset
-and example type in an `ipywidgets` sliding gallery: correctly estimated high/low
-quality, overconfidence and underconfidence. Use dataset/category selectors,
-Previous/Next or the slider, and click **Use for paper** to choose an image.
-Set `CANDIDATES_PER_CATEGORY = 10` for fewer candidates. Review `SELECTED_IDS`,
-preview the final panels, then set
-`EXPORT = True` to write the two paper figures and selection CSVs under
-`paper/plots/`. The notebook uses saved masks and OOF predictions only and
-defaults to detector-unseen images.
+After pre-detection targets have been generated, run the new image-only comparisons:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 poetry run python scripts/cli.py finetune --dataset both
+```
+
+This evaluates frozen ResNet-50 + PCA(256)/Ridge, fine-tuned ResNet-50, and
+fine-tuned DINOv2 ViT-B/14. It reads the existing pre-detection IoU targets and
+never reruns Mask R-CNN or HC extraction. To run just one method:
+
+```bash
+poetry run python scripts/cli.py finetune --dataset ca --models resnet50_finetuned
+```
+
+All three use the same raw-image candidate ROI as frozen DINO, with ImageNet
+normalization. ResNet uses ImageNet V2 pretrained weights (2048-d), a 232-pixel
+short-side resize and 224-pixel center crop; DINO retains its 560/518 bicubic
+preprocessing (768-d).
+## Ablation Studies
+
+```bash
+poetry run python scripts/cli.py ablation
+```
+
+Equivalently: `poetry run python scripts/ablation.py`. This runs cross-dataset
+transfer and individual-feature analysis from saved features, without a GPU.
+
 
 ## Install Dependencies
 
@@ -164,6 +182,9 @@ argument, confidence, TTA, RCA and dropout run. Only selected baselines are
 recomputed; saved results, score columns and protocol files for unselected
 baselines are preserved. Existing scores must match the current image IDs, folds
 and targets. The combined summary includes all saved results for both datasets.
+Detector-based baselines require working CUDA and fail immediately if it cannot
+initialize; there is no CPU fallback. RCA scoring remains CPU-based, and
+`--reuse-existing` requires no GPU. Existing CPU timings are not GPU benchmarks.
 
 
 ### Coverage And Computational Cost

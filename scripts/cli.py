@@ -17,7 +17,9 @@ def main(argv: list[str] | None = None) -> None:
     prepare = commands.add_parser("prepare", help="Prepare local HF downloads")
     run = commands.add_parser("run", help="Run pre/post-detection experiments")
     compare = commands.add_parser("compare", help="Evaluate calibrated confidence, TTA, RCA and dropout-injection baselines")
-    for command in (prepare, run, compare):
+    commands.add_parser("ablation", help="Evaluate cross-dataset RF transfer and held-out feature importance")
+    images = commands.add_parser("embedding_finetune", help="Evaluate frozen ResNet and fine-tuned ResNet/DINO pre-detection models")
+    for command in (prepare, run, compare, images):
         command.add_argument("--dataset", choices=["ca", "glass", "both"], default="both")
     prepare.add_argument("--downloads", type=Path, default=Path("data/downloads"))
     prepare.add_argument("--models", type=Path, default=Path("models"))
@@ -28,7 +30,20 @@ def main(argv: list[str] | None = None) -> None:
     compare.add_argument("--baselines", nargs="+", choices=["confidence", "tta", "rca", "dropout", "ensemble"],
                          default=["confidence", "tta", "rca", "dropout"], help="Run only selected baselines; ensemble trains two new detectors per fold alongside the original")
     compare.add_argument("--reuse-existing", action="store_true", help="Rebuild metrics and cost summaries from saved scores; no inference")
+    images.add_argument("--models", nargs="+", choices=["resnet50_frozen", "resnet50_finetuned", "dinov2_finetuned"],
+                        default=["resnet50_frozen", "resnet50_finetuned", "dinov2_finetuned"])
+    images.add_argument("--epochs", type=int, default=30)
+    images.add_argument("--patience", type=int, default=5)
+    images.add_argument("--batch-size", type=int, default=4)
+    images.add_argument("--workers", type=int, default=2)
+    images.add_argument("--reuse-existing", action="store_true")
     args = parser.parse_args(argv)
+
+    if args.command == "ablation":
+        from scripts.ablation import run_ablation
+
+        run_ablation()
+        return
 
     datasets = ["ca", "glass"] if args.dataset == "both" else [args.dataset]
     if args.command == "prepare":
@@ -39,6 +54,17 @@ def main(argv: list[str] | None = None) -> None:
         return
 
     import pandas as pd
+    if args.command == "embedding_finetune":
+        from scripts.embedding_finetuning import run_embedding_finetuning
+
+        results = pd.concat([run_embedding_finetuning(dataset, args.models, reuse_existing=args.reuse_existing,
+                            epochs=args.epochs, patience=args.patience, batch_size=args.batch_size,
+                            workers=args.workers) for dataset in datasets], ignore_index=True)
+        paths = [Path("outputs/pre_detection") / dataset / "results.csv" for dataset in ("ca", "glass")]
+        pd.concat([pd.read_csv(path) for path in paths if path.exists()], ignore_index=True).to_csv("outputs/pre_detection/summary.csv", index=False)
+        print(results.to_string(index=False))
+        return
+
     if args.command == "compare":
         from scripts.baseline_comparison import run_baseline_comparison
 

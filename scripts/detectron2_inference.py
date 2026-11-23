@@ -108,13 +108,15 @@ def run_fold_inference(
 
 
 def build_predictor(fold_config: DetectorFoldConfig, score_thresh: float):
+    if not torch.cuda.is_available():
+        raise RuntimeError("Mask R-CNN inference requires working CUDA; CPU fallback is disabled.")
     from detectron2.config import get_cfg
     from detectron2.engine import DefaultPredictor
 
     cfg = get_cfg()
     cfg.merge_from_file(str(fold_config.config_path))
     cfg.MODEL.WEIGHTS = str(fold_config.checkpoint_path)
-    cfg.MODEL.DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    cfg.MODEL.DEVICE = "cuda"
     cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = score_thresh
     cfg.freeze()
     return DefaultPredictor(cfg)
